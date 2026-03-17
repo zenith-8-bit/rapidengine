@@ -1,0 +1,38 @@
+# ── Server ──────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+gunicorn==23.0.0
+python-multipart==0.0.12     # file uploads (UploadFile)
+
+# ── Auth ─────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# ── DB ───────────────────────────────────────────────
+sqlalchemy==2.0.36
+alembic==1.14.0              # migrations (optional but recommended)
+
+# ── Config ───────────────────────────────────────────
+python-dotenv==1.0.1
+pydantic[email]==2.10.2
+
+# ── HTTP client (Ollama calls, health checks) ────────
+httpx==0.27.2
+
+# ── Document extraction ──────────────────────────────
+pandas==2.2.3
+openpyxl==3.1.5              # pandas .xlsx support
+pdfplumber==0.11.4           # bank statement PDFs
+Pillow==11.0.0               # image handling
+
+# ── ML / NLP ─────────────────────────────────────────
+transformers==4.46.3         # FinBERT + LayoutLMv3
+torch==2.5.1                 # CPU build; use torch+cu121 for GPU
+sentencepiece==0.2.0
+
+# ── Web research ─────────────────────────────────────
+duckduckgo-search==6.3.5
+
+# ── Export (CAM PDF/DOCX) ─────────────────────────────
+reportlab==4.2.5             # PDF export
+python-docx==1.1.2           # DOCX export
