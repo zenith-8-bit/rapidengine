@@ -1,1366 +1,829 @@
 """
-RapidEngine — Credit Appraisal Engine
-FastAPI backend: serves the SPA + all API routes
+RapidEngine Credit Appraisal Engine — FastAPI Backend
+======================================================
+Endpoints cover:
+  • Session / cookie-based user identity
+  • Case creation + persistence (in-memory; swap Redis/Postgres for prod)
+  • File upload + text extraction  (PyPDF2, openpyxl fallback)
+  • Keyword/regex-based field parsing
+  • Parsed-field save / load
+  • Research agent  (DuckDuckGo via duckduckgo_search)
+  • FinBERT sentiment analysis  (transformers pipeline)
+  • Ollama LLM chat proxy
+  • OpenAI-compatible LLM chat proxy
+  • CAM report generation  (LLM-assisted, JSON-structured)
+  • Immutable audit trail
 
-Project layout expected:
-    app/
-      main.py            ← this file
-      static/
-        index.html       ← the single-page application
-      ml/
-        predictor.py     ← Five-Cs scoring model
-        finbert.py       ← sentiment pipeline
-        layoutlm.py      ← document QA
-      db.py              ← SQLAlchemy engine + session
-      models.py          ← ORM + Pydantic schemas
-    .env                 ← secrets (never commit)
-    requirements.txt
-
-Start:
-    uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-
-Prod (via gunicorn):
-    gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 4
+Run:
+    uvicorn main:app --reload --port 8000
 """
 
 from __future__ import annotations
 
-import os
-import uuid
+import io
 import json
-import asyncio
-import hashlib
+import re
+import uuid
 import logging
-from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-# ── FastAPI + ASGI ────────────────────────────────────────────────────────────
+import httpx
+import openai
+from duckduckgo_search import DDGS
 from fastapi import (
-    FastAPI, Depends, HTTPException, status,
-    BackgroundTasks, UploadFile, File, Form, Request
+    Cookie, FastAPI, File, Form, HTTPException,
+    Request, Response, UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+from transformers import pipeline
+import PyPDF2
 
-# ── Pydantic v2 ───────────────────────────────────────────────────────────────
-from pydantic import BaseModel, Field, EmailStr
-
-# ── Auth ──────────────────────────────────────────────────────────────────────
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-
-# ── DB (SQLAlchemy async) ─────────────────────────────────────────────────────
-from sqlalchemy import (
-    Column, String, Float, Integer, DateTime, Text, ForeignKey, Boolean,
-    create_engine, event
-)
-from sqlalchemy.orm import declarative_base, relationship, Session, sessionmaker
-
-# ── Env ───────────────────────────────────────────────────────────────────────
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-
-DATABASE_URL    = os.getenv("DATABASE_URL", "sqlite:///./rapidengine.db")
-SECRET_KEY      = os.getenv("SECRET_KEY", "change-me-in-production-use-openssl-rand-hex-32")
-ALGORITHM       = "HS256"
-ACCESS_TOKEN_TTL = int(os.getenv("ACCESS_TOKEN_TTL_MINUTES", "480"))   # 8 hours
-UPLOAD_DIR      = Path(os.getenv("UPLOAD_DIR", "./uploads"))
-STATIC_DIR      = Path(os.getenv("STATIC_DIR", "./app/static"))
-OLLAMA_URL      = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen2.5:72b")
-HF_TOKEN        = os.getenv("HF_TOKEN", "")                             # HuggingFace API token
-MAX_UPLOAD_MB   = int(os.getenv("MAX_UPLOAD_MB", "50"))
-
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(level=logging.INFO)
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("rapidengine")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  DATABASE
-# ─────────────────────────────────────────────────────────────────────────────
-
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
-    echo=False,
-)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-
-# ── ORM Models ────────────────────────────────────────────────────────────────
-
-class UserORM(Base):
-    __tablename__ = "users"
-    id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    email       = Column(String, unique=True, index=True, nullable=False)
-    name        = Column(String, nullable=False)
-    role        = Column(String, default="credit_officer")   # credit_officer | manager | admin
-    hashed_pw   = Column(String, nullable=False)
-    is_active   = Column(Boolean, default=True)
-    created_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    cases       = relationship("CaseORM", back_populates="owner")
-
-
-class CaseORM(Base):
-    __tablename__ = "cases"
-    id              = Column(String, primary_key=True, default=lambda: f"CAM-{datetime.now().year}-{str(uuid.uuid4())[:6].upper()}")
-    owner_id        = Column(String, ForeignKey("users.id"), nullable=False)
-    company_name    = Column(String, nullable=False)
-    gstin           = Column(String, index=True)
-    cin             = Column(String)
-    pan             = Column(String)
-    sector          = Column(String)
-    loan_amount_cr  = Column(Float)
-    purpose         = Column(Text)
-    status          = Column(String, default="draft")        # draft | processing | review | approved | rejected
-    step_reached    = Column(Integer, default=1)             # 1=company_info 2=ingest 3=research 4=cam
-    score_total     = Column(Float)
-    score_character = Column(Float)
-    score_capacity  = Column(Float)
-    score_capital   = Column(Float)
-    score_collateral= Column(Float)
-    score_conditions= Column(Float)
-    verdict         = Column(String)                          # APPROVE | CONDITIONAL | REJECT
-    sentiment_score = Column(Float)
-    created_at      = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    updated_at      = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-    owner           = relationship("UserORM", back_populates="cases")
-    documents       = relationship("DocumentORM", back_populates="case", cascade="all, delete-orphan")
-    signals         = relationship("SignalORM",   back_populates="case", cascade="all, delete-orphan")
-    audit_events    = relationship("AuditORM",    back_populates="case", cascade="all, delete-orphan")
-    research_items  = relationship("ResearchORM", back_populates="case", cascade="all, delete-orphan")
-
-
-class DocumentORM(Base):
-    __tablename__ = "documents"
-    id              = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    case_id         = Column(String, ForeignKey("cases.id"), nullable=False)
-    doc_type        = Column(String)   # gst | bank | itr | annual | board | rating
-    original_name   = Column(String)
-    stored_path     = Column(String)
-    extractor       = Column(String)   # pandas | pdfplumber | layoutlmv3 | xml
-    confidence      = Column(Float)
-    extracted_fields= Column(Text)     # JSON blob of key→value pairs
-    status          = Column(String, default="pending")   # pending | processing | complete | failed
-    uploaded_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    case            = relationship("CaseORM", back_populates="documents")
-
-
-class SignalORM(Base):
-    __tablename__ = "signals"
-    id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    case_id     = Column(String, ForeignKey("cases.id"), nullable=False)
-    signal_type = Column(String)   # gst_gap | dscr_decline | nclt | litigation | cash_heavy | ...
-    severity    = Column(String)   # critical | high | medium | info
-    title       = Column(String)
-    description = Column(Text)
-    source      = Column(String)
-    weight      = Column(Float)
-    created_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    case        = relationship("CaseORM", back_populates="signals")
-
-
-class AuditORM(Base):
-    __tablename__ = "audit_events"
-    id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    case_id     = Column(String, ForeignKey("cases.id"), nullable=False)
-    actor       = Column(String)   # user_id or "system"
-    event_type  = Column(String)   # doc_upload | conflict_flag | llm_inference | field_note | sign_off | ...
-    detail      = Column(Text)
-    metadata_   = Column("metadata", Text)  # JSON
-    created_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    case        = relationship("CaseORM", back_populates="audit_events")
-
-
-class ResearchORM(Base):
-    __tablename__ = "research_items"
-    id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    case_id     = Column(String, ForeignKey("cases.id"), nullable=False)
-    headline    = Column(String)
-    summary     = Column(Text)
-    source_name = Column(String)
-    source_url  = Column(String)
-    published   = Column(String)
-    sentiment   = Column(Float)    # FinBERT score
-    weight_label= Column(String)   # Critical | High | Positive | ...
-    created_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    case        = relationship("CaseORM", back_populates="research_items")
-
-
-class ModelConfigORM(Base):
-    __tablename__ = "model_configs"
-    id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    owner_id    = Column(String, ForeignKey("users.id"), nullable=False)
-    provider    = Column(String)    # OpenAI | Anthropic | Google | Groq | Cohere | Custom | Ollama
-    model_name  = Column(String)
-    endpoint    = Column(String)
-    api_key_hash= Column(String)    # SHA-256 — never store plaintext
-    purpose     = Column(String)    # primary_llm | sentiment | document_qa | summarization
-    is_active   = Column(Boolean, default=True)
-    created_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-
-
-# Create all tables
-Base.metadata.create_all(bind=engine)
-
-
-# ── DB dependency ─────────────────────────────────────────────────────────────
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  AUTH
-# ─────────────────────────────────────────────────────────────────────────────
-
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-bearer  = HTTPBearer(auto_error=False)
-
-
-def hash_password(pw: str) -> str:
-    return pwd_ctx.hash(pw)
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_ctx.verify(plain, hashed)
-
-def create_access_token(data: dict) -> str:
-    payload = data.copy()
-    payload["exp"] = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_TTL)
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
-def decode_token(token: str) -> dict:
-    return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-
-
-def get_current_user(
-    creds: HTTPAuthorizationCredentials = Depends(bearer),
-    db: Session = Depends(get_db)
-) -> UserORM:
-    if not creds:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    try:
-        payload = decode_token(creds.credentials)
-        user_id: str = payload.get("sub")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    user = db.query(UserORM).filter(UserORM.id == user_id, UserORM.is_active == True).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    return user
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ML — loaded once at startup, injected via Depends
-# ─────────────────────────────────────────────────────────────────────────────
-
-@lru_cache(maxsize=None)
-def get_finbert_pipeline():
-    """
-    Load FinBERT sentiment pipeline once.
-    Falls back gracefully if HuggingFace is unavailable.
-    """
-    try:
-        from transformers import pipeline
-        return pipeline(
-            "text-classification",
-            model="ProsusAI/finbert",
-            tokenizer="ProsusAI/finbert",
-            use_auth_token=HF_TOKEN or None,
-            device=-1,   # CPU; change to 0 for GPU
-        )
-    except Exception as e:
-        log.warning(f"FinBERT not available: {e}. Sentiment will return 0.0.")
-        return None
-
-
-@lru_cache(maxsize=None)
-def get_layoutlm_pipeline():
-    """
-    Load LayoutLMv3 document-QA pipeline once.
-    Falls back to None if unavailable.
-    """
-    try:
-        from transformers import pipeline
-        return pipeline(
-            "document-question-answering",
-            model="impira/layoutlm-document-qa",
-            use_auth_token=HF_TOKEN or None,
-        )
-    except Exception as e:
-        log.warning(f"LayoutLM not available: {e}. Document QA disabled.")
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PYDANTIC SCHEMAS (request / response)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class RegisterIn(BaseModel):
-    email: str
-    name: str
-    password: str
-    role: str = "credit_officer"
-
-class LoginIn(BaseModel):
-    email: str
-    password: str
-
-class TokenOut(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    user_id: str
-    name: str
-    role: str
-
-class CaseCreateIn(BaseModel):
-    company_name: str
-    gstin: Optional[str] = None
-    cin: Optional[str] = None
-    pan: Optional[str] = None
-    sector: Optional[str] = None
-    loan_amount_cr: Optional[float] = None
-    purpose: Optional[str] = None
-
-class CaseOut(BaseModel):
-    id: str
-    company_name: str
-    gstin: Optional[str]
-    sector: Optional[str]
-    loan_amount_cr: Optional[float]
-    status: str
-    step_reached: int
-    score_total: Optional[float]
-    verdict: Optional[str]
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-class ExtractedFieldsIn(BaseModel):
-    doc_id: str
-    fields: dict[str, Any]   # key → edited value from the UI
-
-class ResearchRunIn(BaseModel):
-    case_id: str
-    queries: list[str]
-
-class ResearchItemIn(BaseModel):
-    headline: str
-    summary: str
-    source_name: str
-    source_url: Optional[str] = None
-    published: Optional[str] = None
-    sentiment: Optional[float] = None
-    weight_label: Optional[str] = None
-
-class ScorecardIn(BaseModel):
-    case_id: str
-    character: float
-    capacity: float
-    capital: float
-    collateral: float
-    conditions: float
-
-class ModelConnectIn(BaseModel):
-    provider: str
-    model_name: str
-    endpoint: Optional[str] = None
-    api_key: Optional[str] = None
-    purpose: str
-
-class AuditEventIn(BaseModel):
-    case_id: str
-    event_type: str
-    detail: str
-    metadata: Optional[dict] = None
-
-class OfficerSignOffIn(BaseModel):
-    case_id: str
-    action: str    # "confirm" | "override_reject"
-    notes: str
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  APP
-# ─────────────────────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="RapidEngine Credit Appraisal API",
-    version="1.0.0",
-    description="Backend for IntelliCredit SPA — cases, documents, ML inference, audit.",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
-)
-
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="RapidEngine Credit Appraisal API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten to your domain in prod
+    allow_origins=["*"],          # lock down in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ── Startup: seed a demo user if DB is empty ──────────────────────────────────
-
-@app.on_event("startup")
-def seed_demo_user():
-    db = SessionLocal()
-    try:
-        if not db.query(UserORM).first():
-            demo = UserORM(
-                email="rkumar@rapidengine.in",
-                name="R. Kumar",
-                role="credit_officer",
-                hashed_pw=hash_password("demo1234"),
-            )
-            db.add(demo)
-            db.commit()
-            log.info("Demo user created: rkumar@rapidengine.in / demo1234")
-    finally:
-        db.close()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROUTE: AUTH
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/api/auth/register", response_model=TokenOut, tags=["auth"])
-def register(body: RegisterIn, db: Session = Depends(get_db)):
-    if db.query(UserORM).filter(UserORM.email == body.email).first():
-        raise HTTPException(400, "Email already registered")
-    user = UserORM(
-        email=body.email, name=body.name,
-        role=body.role, hashed_pw=hash_password(body.password)
-    )
-    db.add(user); db.commit(); db.refresh(user)
-    token = create_access_token({"sub": user.id})
-    return TokenOut(access_token=token, user_id=user.id, name=user.name, role=user.role)
-
-
-@app.post("/api/auth/login", response_model=TokenOut, tags=["auth"])
-def login(body: LoginIn, db: Session = Depends(get_db)):
-    user = db.query(UserORM).filter(UserORM.email == body.email).first()
-    if not user or not verify_password(body.password, user.hashed_pw):
-        raise HTTPException(401, "Invalid credentials")
-    token = create_access_token({"sub": user.id})
-    return TokenOut(access_token=token, user_id=user.id, name=user.name, role=user.role)
-
-
-@app.get("/api/auth/me", tags=["auth"])
-def me(current_user: UserORM = Depends(get_current_user)):
-    return {"id": current_user.id, "name": current_user.name,
-            "email": current_user.email, "role": current_user.role}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROUTE: CASES
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/api/cases", tags=["cases"])
-def create_case(
-    body: CaseCreateIn,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    case = CaseORM(owner_id=current_user.id, **body.model_dump())
-    db.add(case); db.commit(); db.refresh(case)
-    _audit(db, case.id, "system", "case_created",
-           f"Case created for {case.company_name} by {current_user.name}")
-    return {"id": case.id, "message": "Case created"}
-
-
-@app.get("/api/cases", tags=["cases"])
-def list_cases(
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    """Return all cases owned by the logged-in user."""
-    cases = db.query(CaseORM).filter(CaseORM.owner_id == current_user.id)\
-               .order_by(CaseORM.created_at.desc()).all()
-    return [_case_summary(c) for c in cases]
-
-
-@app.get("/api/cases/{case_id}", tags=["cases"])
-def get_case(
-    case_id: str,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    case = _require_case(db, case_id, current_user.id)
-    return _case_detail(case)
-
-
-@app.patch("/api/cases/{case_id}/status", tags=["cases"])
-def update_case_status(
-    case_id: str, status: str,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    case = _require_case(db, case_id, current_user.id)
-    case.status = status
-    db.commit()
-    return {"ok": True}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROUTE: DOCUMENTS / INGESTOR
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/api/cases/{case_id}/documents/upload", tags=["documents"])
-async def upload_document(
-    case_id: str,
-    doc_type: str = Form(...),          # gst | bank | itr | annual | board | rating
-    file: UploadFile = File(...),
-    background: BackgroundTasks = BackgroundTasks(),
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    _require_case(db, case_id, current_user.id)
-
-    # Size guard
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_MB}MB limit")
-
-    # Persist file under uploads/<case_id>/
-    dest_dir = UPLOAD_DIR / case_id
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = f"{doc_type}_{uuid.uuid4().hex[:8]}_{file.filename}"
-    dest_path = dest_dir / safe_name
-    dest_path.write_bytes(content)
-
-    # Choose extractor heuristic
-    extractor = _pick_extractor(file.filename, doc_type)
-
-    doc = DocumentORM(
-        case_id=case_id,
-        doc_type=doc_type,
-        original_name=file.filename,
-        stored_path=str(dest_path),
-        extractor=extractor,
-        status="processing",
-    )
-    db.add(doc); db.commit(); db.refresh(doc)
-
-    _audit(db, case_id, current_user.id, "doc_upload",
-           f"{doc_type} uploaded: {file.filename} — {extractor} queued")
-
-    # Run extraction in the background (non-blocking)
-    background.add_task(_extract_document_bg, doc.id, str(dest_path), doc_type, extractor)
-
-    return {"doc_id": doc.id, "status": "processing", "extractor": extractor}
-
-
-@app.get("/api/cases/{case_id}/documents", tags=["documents"])
-def list_documents(
-    case_id: str,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    _require_case(db, case_id, current_user.id)
-    docs = db.query(DocumentORM).filter(DocumentORM.case_id == case_id).all()
-    return [_doc_summary(d) for d in docs]
-
-
-@app.get("/api/documents/{doc_id}/extraction", tags=["documents"])
-def get_extraction(
-    doc_id: str,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    """Return raw text + parsed fields for the extraction modal."""
-    doc = db.query(DocumentORM).filter(DocumentORM.id == doc_id).first()
-    if not doc:
-        raise HTTPException(404, "Document not found")
-    fields = json.loads(doc.extracted_fields) if doc.extracted_fields else {}
-    raw_text = _read_raw_preview(doc.stored_path, doc.doc_type)
-    return {
-        "doc_id": doc_id,
-        "file_name": doc.original_name,
-        "extractor": doc.extractor,
-        "confidence": doc.confidence,
-        "status": doc.status,
-        "raw_text": raw_text,
-        "fields": fields,
-    }
-
-
-@app.patch("/api/documents/{doc_id}/extraction", tags=["documents"])
-def save_extraction_edits(
-    doc_id: str,
-    body: ExtractedFieldsIn,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    """Officer-edited fields from the extraction modal are saved back here."""
-    doc = db.query(DocumentORM).filter(DocumentORM.id == doc_id).first()
-    if not doc:
-        raise HTTPException(404, "Document not found")
-    existing = json.loads(doc.extracted_fields) if doc.extracted_fields else {}
-    existing.update(body.fields)
-    doc.extracted_fields = json.dumps(existing)
-    db.commit()
-    _audit(db, doc.case_id, current_user.id, "extraction_edit",
-           f"Fields edited in {doc.original_name}")
-    return {"ok": True}
-
-
-@app.post("/api/cases/{case_id}/detect-conflicts", tags=["documents"])
-def detect_conflicts(
-    case_id: str,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    """
-    Run the conflict-detection layer across all ingested documents for a case.
-    Returns detected signals and persists them to the signals table.
-    """
-    case = _require_case(db, case_id, current_user.id)
-    docs = db.query(DocumentORM).filter(
-        DocumentORM.case_id == case_id, DocumentORM.status == "complete"
-    ).all()
-
-    signals = _run_conflict_detection(docs)
-
-    # Persist new signals (replace existing for idempotency)
-    db.query(SignalORM).filter(SignalORM.case_id == case_id).delete()
-    for s in signals:
-        db.add(SignalORM(case_id=case_id, **s))
-    db.commit()
-
-    _audit(db, case_id, "system", "conflict_detection",
-           f"{len(signals)} signals detected")
-
-    return {"signals": signals, "count": len(signals)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROUTE: RESEARCH AGENT
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/api/cases/{case_id}/research/run", tags=["research"])
-async def run_research(
-    case_id: str,
-    body: ResearchRunIn,
-    background: BackgroundTasks = BackgroundTasks(),
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    """
-    Kick off DuckDuckGo web research + FinBERT sentiment in the background.
-    Frontend polls /research/status for completion.
-    """
-    _require_case(db, case_id, current_user.id)
-    _audit(db, case_id, current_user.id, "research_started",
-           f"Queries: {'; '.join(body.queries[:4])}")
-    background.add_task(
-        _run_research_bg, case_id, body.queries,
-        get_finbert_pipeline()
-    )
-    return {"status": "started", "queries": len(body.queries)}
-
-
-@app.get("/api/cases/{case_id}/research", tags=["research"])
-def get_research(
-    case_id: str,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    _require_case(db, case_id, current_user.id)
-    items = db.query(ResearchORM).filter(ResearchORM.case_id == case_id)\
-               .order_by(ResearchORM.created_at.desc()).all()
-    return [_research_out(r) for r in items]
-
-
-@app.post("/api/cases/{case_id}/research/manual", tags=["research"])
-def add_manual_research(
-    case_id: str,
-    body: ResearchItemIn,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    """Allow officer to manually add a news item."""
-    _require_case(db, case_id, current_user.id)
-    item = ResearchORM(case_id=case_id, **body.model_dump())
-    db.add(item); db.commit()
-    return {"ok": True}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROUTE: FIVE-Cs SCORECARD + LLM (CAM)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/api/cases/{case_id}/score", tags=["cam"])
-def save_scorecard(
-    case_id: str,
-    body: ScorecardIn,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    """Save / update the Five-Cs scorecard for a case."""
-    case = _require_case(db, case_id, current_user.id)
-    weights = {"character": 0.20, "capacity": 0.30, "capital": 0.20,
-               "collateral": 0.15, "conditions": 0.15}
-    total = (
-        body.character  * weights["character"]  +
-        body.capacity   * weights["capacity"]   +
-        body.capital    * weights["capital"]    +
-        body.collateral * weights["collateral"] +
-        body.conditions * weights["conditions"]
-    )
-    case.score_character  = body.character
-    case.score_capacity   = body.capacity
-    case.score_capital    = body.capital
-    case.score_collateral = body.collateral
-    case.score_conditions = body.conditions
-    case.score_total      = round(total, 2)
-    case.verdict = _compute_verdict(total)
-    db.commit()
-    _audit(db, case_id, current_user.id, "score_updated",
-           f"Total: {case.score_total} → {case.verdict}")
-    return {"score_total": case.score_total, "verdict": case.verdict}
-
-
-@app.post("/api/cases/{case_id}/cam/generate", tags=["cam"])
-async def generate_cam(
-    case_id: str,
-    background: BackgroundTasks = BackgroundTasks(),
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    """
-    Trigger LLM-based CAM section generation via local Ollama.
-    Sections are generated asynchronously and stored per-case.
-    Poll /cam/status for completion.
-    """
-    case = _require_case(db, case_id, current_user.id)
-    _audit(db, case_id, "system", "llm_inference",
-           f"CAM generation started — model: {OLLAMA_MODEL}")
-    background.add_task(_generate_cam_bg, case_id, case)
-    return {"status": "generating", "model": OLLAMA_MODEL}
-
-
-@app.get("/api/cases/{case_id}/cam", tags=["cam"])
-def get_cam(
-    case_id: str,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    """Return the full CAM payload for the report page."""
-    case = _require_case(db, case_id, current_user.id)
-    docs     = db.query(DocumentORM).filter(DocumentORM.case_id == case_id).all()
-    signals  = db.query(SignalORM).filter(SignalORM.case_id == case_id).all()
-    research = db.query(ResearchORM).filter(ResearchORM.case_id == case_id).all()
-    audit    = db.query(AuditORM).filter(AuditORM.case_id == case_id)\
-                  .order_by(AuditORM.created_at.asc()).all()
-    return {
-        "case": _case_detail(case),
-        "documents": [_doc_summary(d) for d in docs],
-        "signals": [_signal_out(s) for s in signals],
-        "research": [_research_out(r) for r in research],
-        "audit": [_audit_out(a) for a in audit],
-    }
-
-
-@app.post("/api/cases/{case_id}/signoff", tags=["cam"])
-def officer_signoff(
-    case_id: str,
-    body: OfficerSignOffIn,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    case = _require_case(db, case_id, current_user.id)
-    if body.action == "confirm":
-        case.status = "approved"
-    elif body.action == "override_reject":
-        case.status = "rejected"
-        case.verdict = "REJECT"
-    else:
-        raise HTTPException(400, "action must be 'confirm' or 'override_reject'")
-    db.commit()
-    _audit(db, case_id, current_user.id, "officer_signoff",
-           f"Action: {body.action} — Notes: {body.notes[:200]}")
-    return {"ok": True, "status": case.status}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROUTE: SIGNALS / EWS
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/signals", tags=["signals"])
-def all_signals(
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    """Return all active EWS signals across all cases owned by the user."""
-    case_ids = [c.id for c in db.query(CaseORM.id).filter(CaseORM.owner_id == current_user.id)]
-    signals = db.query(SignalORM).filter(SignalORM.case_id.in_(case_ids))\
-                .order_by(SignalORM.weight.desc()).all()
-    return [_signal_out(s) for s in signals]
-
-
-@app.get("/api/cases/{case_id}/signals", tags=["signals"])
-def case_signals(
-    case_id: str,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    _require_case(db, case_id, current_user.id)
-    signals = db.query(SignalORM).filter(SignalORM.case_id == case_id).all()
-    return [_signal_out(s) for s in signals]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROUTE: AUDIT TRAIL
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/audit", tags=["audit"])
-def all_audit(
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    case_ids = [c.id for c in db.query(CaseORM.id).filter(CaseORM.owner_id == current_user.id)]
-    events = db.query(AuditORM).filter(AuditORM.case_id.in_(case_ids))\
-               .order_by(AuditORM.created_at.desc()).limit(200).all()
-    return [_audit_out(e) for e in events]
-
-
-@app.post("/api/audit/note", tags=["audit"])
-def add_field_note(
-    body: AuditEventIn,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    _require_case(db, body.case_id, current_user.id)
-    _audit(db, body.case_id, current_user.id, body.event_type, body.detail,
-           body.metadata)
-    return {"ok": True}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROUTE: DASHBOARD STATS
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/dashboard/stats", tags=["dashboard"])
-def dashboard_stats(
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    cases = db.query(CaseORM).filter(CaseORM.owner_id == current_user.id).all()
-    total_exposure = sum(c.loan_amount_cr or 0 for c in cases)
-    pending_review = sum(1 for c in cases if c.status == "review")
-    case_ids = [c.id for c in cases]
-    critical_signals = db.query(SignalORM).filter(
-        SignalORM.case_id.in_(case_ids), SignalORM.severity == "critical"
-    ).count()
-    return {
-        "active_applications": len(cases),
-        "pending_review": pending_review,
-        "ews_alerts": critical_signals,
-        "total_exposure_cr": round(total_exposure, 2),
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROUTE: MODEL CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/models", tags=["models"])
-def list_models(
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    configs = db.query(ModelConfigORM)\
-                .filter(ModelConfigORM.owner_id == current_user.id,
-                        ModelConfigORM.is_active == True).all()
-    return [_model_config_out(m) for m in configs]
-
-
-@app.post("/api/models", tags=["models"])
-def connect_model(
-    body: ModelConnectIn,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    api_key_hash = (
-        hashlib.sha256(body.api_key.encode()).hexdigest()
-        if body.api_key else None
-    )
-    cfg = ModelConfigORM(
-        owner_id=current_user.id,
-        provider=body.provider,
-        model_name=body.model_name,
-        endpoint=body.endpoint,
-        api_key_hash=api_key_hash,
-        purpose=body.purpose,
-    )
-    db.add(cfg); db.commit()
-    return {"id": cfg.id, "status": "connected"}
-
-
-@app.delete("/api/models/{model_id}", tags=["models"])
-def disconnect_model(
-    model_id: str,
-    db: Session = Depends(get_db),
-    current_user: UserORM = Depends(get_current_user)
-):
-    cfg = db.query(ModelConfigORM).filter(
-        ModelConfigORM.id == model_id, ModelConfigORM.owner_id == current_user.id
-    ).first()
-    if not cfg:
-        raise HTTPException(404, "Model config not found")
-    cfg.is_active = False
-    db.commit()
-    return {"ok": True}
-
-
-@app.get("/api/models/health", tags=["models"])
-async def model_health():
-    """Check Ollama + HuggingFace reachability."""
-    import httpx
-    results = {}
-    try:
-        async with httpx.AsyncClient(timeout=4) as c:
-            r = await c.get(f"{OLLAMA_URL}/api/tags")
-            results["ollama"] = "online" if r.status_code == 200 else "degraded"
-    except Exception:
-        results["ollama"] = "offline"
-    results["finbert"]  = "loaded" if get_finbert_pipeline() else "unavailable"
-    results["layoutlm"] = "loaded" if get_layoutlm_pipeline() else "unavailable"
+# ── In-memory storage ─────────────────────────────────────────────────────────
+USERS:     dict[str, dict] = {}   # session_id → user payload
+CASES:     dict[str, dict] = {}   # case_id    → case payload
+DOCUMENTS: dict[str, dict] = {}   # doc_id     → document payload
+AUDIT_LOG: list[dict]       = []   # append-only
+
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# ── FinBERT (lazy) ────────────────────────────────────────────────────────────
+_finbert: Any = None
+
+def get_finbert():
+    global _finbert
+    if _finbert is None:
+        log.info("Loading FinBERT model…")
+        _finbert = pipeline("text-classification", model="ProsusAI/finbert", top_k=None)
+        log.info("FinBERT loaded.")
+    return _finbert
+
+# ──────────────────────────────────────────────────────────────────────────────
+# KEYWORD / REGEX FIELD EXTRACTION
+# Each entry: field_key → [list of regex patterns]
+# First captured group (group 1) or full match is used as the value.
+# ──────────────────────────────────────────────────────────────────────────────
+FIELD_PATTERNS: dict[str, list[str]] = {
+    # — Identity ——————————————————————————————————————————
+    "company_name":      [r"(?:Taxpayer|Company Name|Account Name)[:\s]+([A-Za-z0-9 &.,()'-]+)",
+                          r"^([A-Z][A-Za-z ]+(?:Ltd|Pvt|LLP|Inc|Limited))"],
+    "gstin":             [r"GSTIN[:\s]+([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])"],
+    "pan":               [r"PAN[:\s]+([A-Z]{5}[0-9]{4}[A-Z])"],
+    "cin":               [r"CIN[:\s]+([A-Z][0-9]{5}[A-Z]{2}[0-9]{4}[A-Z]{3}[0-9]{6})"],
+    "period":            [r"[Pp]eriod[:\s]+([A-Za-z]+ \d{4}\s*[–\-]\s*[A-Za-z]+ \d{4})"],
+
+    # — GST ———————————————————————————————————————————————
+    "annual_turnover":   [r"(?:TOTAL ANNUAL TURNOVER|Revenue from Operations)[^₹\n]*₹?([\d,]+(?:\.\d+)?(?:\s*Cr)?)"],
+    "itc_claimed":       [r"(?:ITC Claimed|ITC in 3B)[:\s₹]*([\d,]+(?:\.\d+)?)"],
+    "itc_2a":            [r"(?:ITC as per 2A|2A[^:]*:)[:\s₹]*([\d,]+(?:\.\d+)?)"],
+    "itc_gap_pct":       [r"(?:DISCREPANCY|gap)[^%\n]*?(\d+(?:\.\d+)?)\s*%"],
+    "total_tax_paid":    [r"(?:TOTAL TAX PAID|Tax Paid)[:\s₹]*([\d,]+(?:\.\d+)?)"],
+    "filing_status":     [r"(All \d+ returns? filed[^\n]*)"],
+
+    # — Bank ——————————————————————————————————————————————
+    "bank_name":         [r"(?:^|\n)([A-Z]+ BANK)"],
+    "account_number":    [r"Account No[:\s]+([X0-9 ]+)"],
+    "total_credits":     [r"Total Credits?[:\s₹]*([\d,]+(?:\.\d+)?)"],
+    "total_debits":      [r"Total Debits?[:\s₹]*([\d,]+(?:\.\d+)?)"],
+    "closing_balance":   [r"Closing Balance[:\s₹]*([\d,]+(?:\.\d+)?)"],
+    "cash_deposit_pct":  [r"Cash Deposits?[^%\n]*?(\d+(?:\.\d+)?)\s*%"],
+    "cc_utilization":    [r"CC\s*[Ll]imit\s*[Uu]til[^₹\n]*₹?([\d,]+(?:\.\d+)?)"],
+    "emi_detected":      [r"(?:Term Loan|TL)[^\n]*EMI[:\s₹]*([\d,]+(?:\.\d+)?)"],
+
+    # — Financials (Annual Report / ITR) ——————————————————
+    "revenue":           [r"Revenue from Operations[:\s₹]*([\d,]+(?:\.\d+)?(?:\s*Cr)?)"],
+    "ebitda":            [r"EBITDA[:\s₹]*([\d,]+(?:\.\d+)?(?:\s*Cr)?)"],
+    "ebitda_margin":     [r"EBITDA\s*[Mm]argin[:\s]*([\d.]+)\s*%"],
+    "pat":               [r"PAT[:\s₹]*([\d,]+(?:\.\d+)?(?:\s*Cr)?)"],
+    "net_worth":         [r"Net Worth[:\s₹]*([\d,]+(?:\.\d+)?(?:\s*Cr)?)"],
+    "total_debt":        [r"Total Debt[:\s₹]*([\d,]+(?:\.\d+)?(?:\s*Cr)?)"],
+    "debt_equity_ratio": [r"Debt[- ]Equity Ratio[:\s]*([\d.]+)\s*x?"],
+    "dscr":              [r"DSCR[:\s]*([\d.]+)\s*x?"],
+    "interest_coverage": [r"Interest Coverage[:\s]*([\d.]+)\s*x?"],
+    "roc_charge":        [r"Charge\s*ID[^\n₹]*(₹[\d,]+(?:\.\d+)?(?:\s*Cr)?)"],
+    "capacity_util":     [r"(\d+)\s*%\s*capacity"],
+}
+
+def extract_fields(text: str) -> dict[str, str]:
+    """Run all FIELD_PATTERNS against raw text; return best match per key."""
+    results: dict[str, str] = {}
+    for field, patterns in FIELD_PATTERNS.items():
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE | re.MULTILINE)
+            if m:
+                val = m.group(1).strip() if m.lastindex else m.group(0).strip()
+                results[field] = val
+                break
     return results
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def new_id(prefix: str = "") -> str:
+    return prefix + uuid.uuid4().hex[:12].upper()
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  STATIC + SPA CATCH-ALL  (must be declared LAST)
-# ─────────────────────────────────────────────────────────────────────────────
+def audit(case_id: str, event: str, actor: str, detail: str, severity: str = "info"):
+    AUDIT_LOG.append({
+        "ts":       datetime.utcnow().isoformat(),
+        "case_id":  case_id,
+        "event":    event,
+        "actor":    actor,
+        "detail":   detail,
+        "severity": severity,
+    })
 
-if STATIC_DIR.exists():
-    # Serve index.html for every non-API route (client-side hash router)
-    @app.get("/{full_path:path}", include_in_schema=False)
-    def serve_spa(full_path: str):
-        index = STATIC_DIR / "inde.html"
-        if index.exists():
-            return FileResponse(index)
-        raise HTTPException(404, "SPA not found — place index.html in app/static/")
-
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-else:
-    log.warning(f"Static dir {STATIC_DIR} not found — SPA will not be served.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  HELPERS — serialisers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _case_summary(c: CaseORM) -> dict:
-    return {
-        "id": c.id, "company_name": c.company_name, "gstin": c.gstin,
-        "sector": c.sector, "loan_amount_cr": c.loan_amount_cr,
-        "status": c.status, "step_reached": c.step_reached,
-        "score_total": c.score_total, "verdict": c.verdict,
-        "created_at": c.created_at.isoformat() if c.created_at else None,
+def resolve_session(session_id: Optional[str]) -> str:
+    if session_id and session_id in USERS:
+        return session_id
+    sid = new_id("SID")
+    USERS[sid] = {
+        "name": "R. Kumar",
+        "role": "Senior Credit Officer",
+        "created_at": datetime.utcnow().isoformat(),
     }
+    return sid
 
-def _case_detail(c: CaseORM) -> dict:
-    return {
-        **_case_summary(c),
-        "cin": c.cin, "pan": c.pan, "purpose": c.purpose,
-        "score_character": c.score_character, "score_capacity": c.score_capacity,
-        "score_capital": c.score_capital, "score_collateral": c.score_collateral,
-        "score_conditions": c.score_conditions, "sentiment_score": c.sentiment_score,
+def session_cases(sid: str) -> list[dict]:
+    return [c for c in CASES.values() if c.get("session_id") == sid]
+
+def case_docs(case_id: str) -> list[dict]:
+    return [d for d in DOCUMENTS.values() if d.get("case_id") == case_id]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Text extraction
+# ──────────────────────────────────────────────────────────────────────────────
+def extract_text_pdf(data: bytes) -> str:
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(data))
+        return "\n\n".join(
+            p.extract_text() or "" for p in reader.pages
+        )
+    except Exception as e:
+        log.warning("PyPDF2 error: %s", e)
+        return ""
+
+def extract_text(data: bytes, filename: str) -> str:
+    fn = (filename or "").lower()
+    if fn.endswith(".pdf"):
+        return extract_text_pdf(data)
+    if fn.endswith((".txt", ".csv", ".tsv", ".xml")):
+        return data.decode("utf-8", errors="replace")
+    if fn.endswith((".xlsx", ".xls")):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
+            lines: list[str] = []
+            for ws in wb.worksheets:
+                lines.append(f"=== Sheet: {ws.title} ===")
+                for row in ws.iter_rows(values_only=True):
+                    row_str = [str(c) if c is not None else "" for c in row]
+                    if any(v.strip() for v in row_str):
+                        lines.append("\t".join(row_str))
+            return "\n".join(lines)
+        except Exception as e:
+            log.warning("openpyxl error: %s", e)
+            return ""
+    if fn.endswith(".docx"):
+        try:
+            import docx
+            doc = docx.Document(io.BytesIO(data))
+            return "\n".join(p.text for p in doc.paragraphs)
+        except Exception as e:
+            log.warning("python-docx error: %s", e)
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return "[Binary — extraction not supported]"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ══ 1. SESSION ════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/session", tags=["Session"])
+async def get_session(response: Response, session_id: Optional[str] = Cookie(None)):
+    """Return or create a session. Sets httpOnly cookie."""
+    sid = resolve_session(session_id)
+    response.set_cookie("session_id", sid, max_age=86400 * 30, httponly=True, samesite="lax")
+    return {"session_id": sid, "user": USERS[sid]}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ══ 2. CASES ══════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+
+class NewCaseRequest(BaseModel):
+    company_name: str
+    gstin:        str   = ""
+    cin:          str   = ""
+    pan:          str   = ""
+    sector:       str   = ""
+    loan_amount:  float = 0.0
+    purpose:      str   = ""
+
+@app.post("/api/cases", tags=["Cases"])
+async def create_case(
+    payload:    NewCaseRequest,
+    response:   Response,
+    session_id: Optional[str] = Cookie(None),
+):
+    sid = resolve_session(session_id)
+    response.set_cookie("session_id", sid, max_age=86400 * 30, httponly=True, samesite="lax")
+
+    case_id = new_id("CASE")
+    seq     = len(session_cases(sid)) + 1
+    cam_ref = f"CAM-2025-{seq:03d}"
+
+    case = {
+        "case_id":               case_id,
+        "cam_ref":               cam_ref,
+        "session_id":            sid,
+        "company_name":          payload.company_name,
+        "gstin":                 payload.gstin,
+        "cin":                   payload.cin,
+        "pan":                   payload.pan,
+        "sector":                payload.sector,
+        "loan_amount":           payload.loan_amount,
+        "purpose":               payload.purpose,
+        "status":                "data_ingest",
+        "score":                 None,
+        "verdict":               None,
+        "five_cs":               {},
+        "conditions_of_sanction":[],
+        "cam_sections":          {},
+        "research_findings":     [],
+        "officer_notes":         "",
+        "created_at":            datetime.utcnow().isoformat(),
+        "updated_at":            datetime.utcnow().isoformat(),
     }
-
-def _doc_summary(d: DocumentORM) -> dict:
-    return {
-        "id": d.id, "doc_type": d.doc_type, "original_name": d.original_name,
-        "extractor": d.extractor, "confidence": d.confidence, "status": d.status,
-        "uploaded_at": d.uploaded_at.isoformat() if d.uploaded_at else None,
-    }
-
-def _signal_out(s: SignalORM) -> dict:
-    return {
-        "id": s.id, "case_id": s.case_id, "signal_type": s.signal_type,
-        "severity": s.severity, "title": s.title, "description": s.description,
-        "source": s.source, "weight": s.weight,
-    }
-
-def _research_out(r: ResearchORM) -> dict:
-    return {
-        "id": r.id, "headline": r.headline, "summary": r.summary,
-        "source_name": r.source_name, "source_url": r.source_url,
-        "published": r.published, "sentiment": r.sentiment,
-        "weight_label": r.weight_label,
-    }
-
-def _audit_out(a: AuditORM) -> dict:
-    return {
-        "id": a.id, "case_id": a.case_id, "actor": a.actor,
-        "event_type": a.event_type, "detail": a.detail,
-        "created_at": a.created_at.isoformat() if a.created_at else None,
-    }
-
-def _model_config_out(m: ModelConfigORM) -> dict:
-    return {
-        "id": m.id, "provider": m.provider, "model_name": m.model_name,
-        "purpose": m.purpose, "is_active": m.is_active,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  HELPERS — business logic
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _require_case(db: Session, case_id: str, user_id: str) -> CaseORM:
-    case = db.query(CaseORM).filter(
-        CaseORM.id == case_id, CaseORM.owner_id == user_id
-    ).first()
-    if not case:
-        raise HTTPException(404, "Case not found or access denied")
+    CASES[case_id] = case
+    audit(case_id, "Case Created", USERS[sid]["name"],
+          f"{payload.company_name} · ₹{payload.loan_amount} Cr requested")
     return case
 
+@app.get("/api/cases", tags=["Cases"])
+async def list_cases(session_id: Optional[str] = Cookie(None)):
+    return session_cases(resolve_session(session_id))
 
-def _audit(db: Session, case_id: str, actor: str, event_type: str,
-           detail: str, metadata: dict = None):
-    db.add(AuditORM(
-        case_id=case_id, actor=actor, event_type=event_type, detail=detail,
-        metadata_=json.dumps(metadata) if metadata else None,
-    ))
-    db.commit()
+@app.get("/api/cases/{case_id}", tags=["Cases"])
+async def get_case(case_id: str, session_id: Optional[str] = Cookie(None)):
+    sid  = resolve_session(session_id)
+    case = CASES.get(case_id)
+    if not case or case["session_id"] != sid:
+        raise HTTPException(404, "Case not found")
+    return case
 
+@app.patch("/api/cases/{case_id}", tags=["Cases"])
+async def update_case(
+    case_id:    str,
+    payload:    dict,
+    session_id: Optional[str] = Cookie(None),
+):
+    sid  = resolve_session(session_id)
+    case = CASES.get(case_id)
+    if not case or case["session_id"] != sid:
+        raise HTTPException(404, "Case not found")
+    allowed = {"status", "officer_notes", "score", "verdict",
+               "five_cs", "conditions_of_sanction"}
+    for k, v in payload.items():
+        if k in allowed:
+            case[k] = v
+    case["updated_at"] = datetime.utcnow().isoformat()
+    audit(case_id, "Case Updated", USERS[sid]["name"], str({k: v for k, v in payload.items() if k in allowed}))
+    return case
 
-def _pick_extractor(filename: str, doc_type: str) -> str:
-    fname = filename.lower()
-    if doc_type == "gst" and (fname.endswith(".xlsx") or fname.endswith(".csv")):
-        return "pandas"
-    if fname.endswith(".xml"):
-        return "xml_parser"
-    if fname.endswith(".pdf"):
-        return "layoutlmv3" if doc_type == "annual" else "pdfplumber"
-    return "pdfplumber"
+# ──────────────────────────────────────────────────────────────────────────────
+# ══ 3. DOCUMENTS ══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 
-
-def _compute_verdict(score: float) -> str:
-    if score >= 70:
-        return "APPROVE"
-    if score >= 50:
-        return "CONDITIONAL"
-    return "REJECT"
-
-
-def _read_raw_preview(stored_path: str, doc_type: str) -> str:
-    """Return a plain-text preview of the file for the extraction modal."""
-    try:
-        path = Path(stored_path)
-        if not path.exists():
-            return "(file not found)"
-        if path.suffix in (".xlsx", ".csv"):
-            import pandas as pd
-            df = pd.read_excel(path) if path.suffix == ".xlsx" else pd.read_csv(path)
-            return df.to_string(max_rows=40, max_cols=8)
-        if path.suffix == ".pdf":
-            import pdfplumber
-            with pdfplumber.open(path) as pdf:
-                pages = [p.extract_text() or "" for p in pdf.pages[:4]]
-            return "\n\n[Page break]\n\n".join(pages)[:4000]
-        return path.read_text(errors="replace")[:4000]
-    except Exception as e:
-        return f"(preview error: {e})"
-
-
-def _run_conflict_detection(docs: list[DocumentORM]) -> list[dict]:
+@app.post("/api/cases/{case_id}/documents", tags=["Documents"])
+async def upload_document(
+    case_id:    str,
+    file:       UploadFile          = File(...),
+    doc_type:   str                 = Form("generic"),
+    session_id: Optional[str]       = Cookie(None),
+):
     """
-    Pure Python conflict rules — runs synchronously, fast.
-    Returns list of signal dicts ready to be inserted.
+    Upload a document, extract raw text, run regex parsing.
+    Accepted doc_type values: gst | bank | annual | itr | board | rating | generic
     """
-    signals = []
-    fields_by_type: dict[str, dict] = {}
-    for doc in docs:
-        if doc.extracted_fields:
-            fields_by_type[doc.doc_type] = json.loads(doc.extracted_fields)
+    sid  = resolve_session(session_id)
+    case = CASES.get(case_id)
+    if not case or case["session_id"] != sid:
+        raise HTTPException(404, "Case not found")
 
-    gst  = fields_by_type.get("gst",  {})
-    bank = fields_by_type.get("bank", {})
+    data     = await file.read()
+    raw_text = extract_text(data, file.filename or "upload")
+    parsed   = extract_fields(raw_text)
 
-    # Rule 1 — GST vs Bank turnover gap
-    try:
-        gst_turnover  = float(str(gst.get("turnover",  "0")).replace("₹", "").replace(",", "").split()[0])
-        bank_credits  = float(str(bank.get("credits",  "0")).replace("₹", "").replace(",", "").split()[0])
-        if gst_turnover > 0 and bank_credits > 0:
-            gap_pct = abs(gst_turnover - bank_credits) / gst_turnover * 100
-            if gap_pct > 15:
-                signals.append({
-                    "signal_type": "gst_bank_gap",
-                    "severity": "critical" if gap_pct > 20 else "high",
-                    "title": "GST vs Bank Turnover Gap",
-                    "description": f"GSTR-3B: ₹{gst_turnover:,.0f}  Bank Credits: ₹{bank_credits:,.0f}  Gap: {gap_pct:.1f}%",
-                    "source": "gst + bank_stmt",
-                    "weight": 0.90,
-                })
-    except Exception:
-        pass
+    # Simple confidence heuristic
+    hits       = sum(1 for v in parsed.values() if v)
+    confidence = min(98, max(30, int(hits / max(len(FIELD_PATTERNS), 1) * 100 * 2.5)))
 
-    # Rule 2 — Cash-heavy revenue
-    try:
-        cash_pct_raw = str(bank.get("cash_pct", "0"))
-        cash_pct = float(cash_pct_raw.split("%")[0].strip())
-        if cash_pct > 50:
-            signals.append({
-                "signal_type": "cash_heavy_revenue",
-                "severity": "high",
-                "title": "Cash-heavy Revenue Pattern",
-                "description": f"{cash_pct:.0f}% of credits via cash — above sector norm of 40%",
-                "source": "bank_stmt",
-                "weight": 0.75,
-            })
-    except Exception:
-        pass
+    doc_id = new_id("DOC")
+    dest   = UPLOAD_DIR / f"{doc_id}_{file.filename}"
+    dest.write_bytes(data)
 
-    # Rule 3 — GSTR-2A / 3B ITC gap
-    try:
-        gap_raw = str(gst.get("itc_gap", "0")).replace("%", "").strip()
-        itc_gap_pct = float(gap_raw.split()[0])
-        if itc_gap_pct > 10:
-            signals.append({
-                "signal_type": "itc_gap",
-                "severity": "high",
-                "title": "GSTR-2A / 3B ITC Discrepancy",
-                "description": f"ITC gap: {itc_gap_pct:.1f}% — possible input tax credit inflation",
-                "source": "gst",
-                "weight": 0.85,
-            })
-    except Exception:
-        pass
+    doc = {
+        "doc_id":        doc_id,
+        "case_id":       case_id,
+        "filename":      file.filename,
+        "doc_type":      doc_type,
+        "size_bytes":    len(data),
+        "raw_text":      raw_text,
+        "parsed_fields": parsed,
+        "confidence":    confidence,
+        "status":        "complete",
+        "filepath":      str(dest),
+        "uploaded_at":   datetime.utcnow().isoformat(),
+    }
+    DOCUMENTS[doc_id] = doc
+    case["updated_at"] = datetime.utcnow().isoformat()
+    audit(case_id, "Document Uploaded", USERS[sid]["name"],
+          f"{file.filename} · {doc_type} · {confidence}% confidence",
+          severity="info")
 
-    return signals
+    # Return lightweight version
+    return {**doc, "raw_text": raw_text[:400] + ("…" if len(raw_text) > 400 else "")}
 
+@app.get("/api/cases/{case_id}/documents", tags=["Documents"])
+async def list_documents(case_id: str, session_id: Optional[str] = Cookie(None)):
+    sid  = resolve_session(session_id)
+    case = CASES.get(case_id)
+    if not case or case["session_id"] != sid:
+        raise HTTPException(404, "Case not found")
+    # Strip raw_text for listing (potentially large)
+    return [{k: v for k, v in d.items() if k != "raw_text"} for d in case_docs(case_id)]
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  BACKGROUND TASKS
-# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/documents/{doc_id}", tags=["Documents"])
+async def get_document(doc_id: str, session_id: Optional[str] = Cookie(None)):
+    """Full document detail including raw_text — used by extraction modal."""
+    sid = resolve_session(session_id)
+    doc = DOCUMENTS.get(doc_id)
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    case = CASES.get(doc["case_id"])
+    if not case or case["session_id"] != sid:
+        raise HTTPException(403, "Access denied")
+    return doc
 
-def _extract_document_bg(doc_id: str, file_path: str, doc_type: str, extractor: str):
+@app.patch("/api/documents/{doc_id}/fields", tags=["Documents"])
+async def save_fields(
+    doc_id:     str,
+    payload:    dict,
+    session_id: Optional[str] = Cookie(None),
+):
+    """Persist user-edited parsed fields from the extraction modal."""
+    sid = resolve_session(session_id)
+    doc = DOCUMENTS.get(doc_id)
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    case = CASES.get(doc["case_id"])
+    if not case or case["session_id"] != sid:
+        raise HTTPException(403, "Access denied")
+    doc["parsed_fields"].update(payload)
+    doc["last_edited"] = datetime.utcnow().isoformat()
+    audit(doc["case_id"], "Fields Edited", USERS[sid]["name"],
+          f"{doc['filename']} — {len(payload)} field(s) saved")
+    return doc["parsed_fields"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ══ 4. RESEARCH AGENT ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ResearchRequest(BaseModel):
+    queries:                list[str]
+    max_results_per_query:  int = 5
+
+@app.post("/api/cases/{case_id}/research", tags=["Research"])
+async def run_research(
+    case_id:    str,
+    payload:    ResearchRequest,
+    session_id: Optional[str] = Cookie(None),
+):
     """
-    Runs extraction in a background thread.
-    Updates the document record with extracted fields + confidence.
+    DuckDuckGo search for each query string.
+    FinBERT sentiment applied to each headline.
+    Results stored on the case.
     """
-    db = SessionLocal()
-    try:
-        doc = db.query(DocumentORM).filter(DocumentORM.id == doc_id).first()
-        if not doc:
-            return
+    sid  = resolve_session(session_id)
+    case = CASES.get(case_id)
+    if not case or case["session_id"] != sid:
+        raise HTTPException(404, "Case not found")
 
-        fields: dict = {}
-        confidence: float = 0.0
+    finbert  = get_finbert()
+    findings: list[dict] = []
+    ddgs = DDGS()
 
-        if extractor == "pandas":
-            fields, confidence = _extract_gst_xlsx(file_path)
-        elif extractor == "pdfplumber":
-            fields, confidence = _extract_bank_pdf(file_path)
-        elif extractor == "layoutlmv3":
-            fields, confidence = _extract_annual_report(file_path)
-        elif extractor == "xml_parser":
-            fields, confidence = _extract_itr_xml(file_path)
-        else:
-            confidence = 0.5
-
-        doc.extracted_fields = json.dumps(fields)
-        doc.confidence = confidence
-        doc.status = "complete"
-        db.commit()
-        log.info(f"Extraction done: {doc_id} confidence={confidence:.2f}")
-    except Exception as e:
-        log.error(f"Extraction failed for {doc_id}: {e}")
-        doc = db.query(DocumentORM).filter(DocumentORM.id == doc_id).first()
-        if doc:
-            doc.status = "failed"
-            db.commit()
-    finally:
-        db.close()
-
-
-def _extract_gst_xlsx(file_path: str) -> tuple[dict, float]:
-    """Extract key fields from GSTR-3B Excel file."""
-    try:
-        import pandas as pd
-        df = pd.read_excel(file_path)
-        # Simplified extraction — real implementation would parse GSTN schema
-        return {
-            "turnover": "auto-detected",
-            "itc_claimed": "auto-detected",
-            "filing": "All months filed",
-            "_note": "Run full parse in production",
-        }, 0.97
-    except Exception as e:
-        return {"_error": str(e)}, 0.0
-
-
-def _extract_bank_pdf(file_path: str) -> tuple[dict, float]:
-    try:
-        import pdfplumber
-        with pdfplumber.open(file_path) as pdf:
-            text = " ".join(p.extract_text() or "" for p in pdf.pages)
-        return {"_raw_length": len(text), "_note": "Parse amounts with regex in production"}, 0.89
-    except Exception as e:
-        return {"_error": str(e)}, 0.0
-
-
-def _extract_annual_report(file_path: str) -> tuple[dict, float]:
-    pipe = get_layoutlm_pipeline()
-    if not pipe:
-        return {"_note": "LayoutLM unavailable — manual entry required"}, 0.0
-    # LayoutLM requires image+question pairs; full implementation in ml/layoutlm.py
-    return {"_note": "LayoutLM extraction queued"}, 0.40
-
-
-def _extract_itr_xml(file_path: str) -> tuple[dict, float]:
-    try:
-        import xml.etree.ElementTree as ET
-        tree = ET.parse(file_path)
-        root = tree.getroot()
-        return {"xml_tags": len(list(root.iter()))}, 0.95
-    except Exception as e:
-        return {"_error": str(e)}, 0.0
-
-
-async def _run_research_bg(case_id: str, queries: list[str], finbert_pipe):
-    """
-    Web search via DuckDuckGo (no API key) + FinBERT sentiment per article.
-    Results persisted to research_items table.
-    """
-    db = SessionLocal()
-    try:
-        from duckduckgo_search import DDGS
-        results = []
-        with DDGS() as ddgs:
-            for q in queries[:4]:
-                for r in ddgs.text(q, max_results=3):
-                    sentiment = 0.0
-                    if finbert_pipe and r.get("body"):
-                        try:
-                            out = finbert_pipe(r["body"][:512], truncation=True)[0]
-                            label_map = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}
-                            sentiment = label_map.get(out["label"].lower(), 0.0) * out["score"]
-                        except Exception:
-                            pass
-                    item = ResearchORM(
-                        case_id=case_id,
-                        headline=r.get("title", "")[:300],
-                        summary=r.get("body", "")[:1000],
-                        source_name=r.get("source", "Web"),
-                        source_url=r.get("href"),
-                        published=r.get("date"),
-                        sentiment=round(sentiment, 3),
-                        weight_label="Critical" if sentiment < -0.6 else
-                                     "High"     if sentiment < -0.3 else
-                                     "Positive" if sentiment > 0.3  else "Neutral",
-                    )
-                    db.add(item)
-        # Update case average sentiment
-        items = db.query(ResearchORM).filter(ResearchORM.case_id == case_id).all()
-        scores = [i.sentiment for i in items if i.sentiment is not None]
-        if scores:
-            avg = sum(scores) / len(scores)
-            case = db.query(CaseORM).filter(CaseORM.id == case_id).first()
-            if case:
-                case.sentiment_score = round(avg, 3)
-        db.commit()
-        log.info(f"Research complete for {case_id}: {len(items)} items")
-    except ImportError:
-        log.warning("duckduckgo_search not installed — pip install duckduckgo-search")
-    except Exception as e:
-        log.error(f"Research failed for {case_id}: {e}")
-    finally:
-        db.close()
-
-
-async def _generate_cam_bg(case_id: str, case: CaseORM):
-    """
-    Call local Ollama to generate CAM narrative sections.
-    Stores result as an audit event (full JSON) for the report page.
-    """
-    import httpx
-    db = SessionLocal()
-    try:
-        docs = db.query(DocumentORM).filter(DocumentORM.case_id == case_id, DocumentORM.status == "complete").all()
-        signals = db.query(SignalORM).filter(SignalORM.case_id == case_id).all()
-        research = db.query(ResearchORM).filter(ResearchORM.case_id == case_id).all()
-
-        context = f"""
-You are a senior credit analyst. Generate a Credit Appraisal Memo (CAM) for the following case.
-
-Company: {case.company_name}
-GSTIN: {case.gstin}
-Sector: {case.sector}
-Loan Amount: ₹{case.loan_amount_cr} Crore
-Purpose: {case.purpose}
-Five-Cs Scores: Character={case.score_character}, Capacity={case.score_capacity},
-  Capital={case.score_capital}, Collateral={case.score_collateral}, Conditions={case.score_conditions}
-Total Score: {case.score_total}/100
-Verdict: {case.verdict}
-
-Signals detected: {[s.title for s in signals]}
-Research sentiment (avg): {case.sentiment_score}
-Ingested documents: {[d.doc_type for d in docs]}
-
-Generate a JSON response with keys: character, capacity, capital, collateral, conditions,
-conditions_of_sanction (list), summary. Each section: 2-3 sentences. Be concise and factual.
-Respond ONLY with valid JSON, no markdown fences.
-"""
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": OLLAMA_MODEL, "prompt": context, "stream": False,
-                      "options": {"temperature": 0.1, "num_ctx": 8192}}
-            )
-            raw = resp.json().get("response", "{}")
-
+    for query in payload.queries[:4]:
         try:
-            sections = json.loads(raw)
-        except json.JSONDecodeError:
-            sections = {"_raw": raw}
+            results = list(ddgs.text(query, max_results=payload.max_results_per_query))
+        except Exception as e:
+            log.warning("DDG search failed '%s': %s", query, e)
+            results = []
 
-        # Store as a special audit event (acts as the CAM content store)
-        _audit(db, case_id, "system", "llm_cam_output",
-               f"{OLLAMA_MODEL} CAM generation complete",
-               {"sections": sections, "model": OLLAMA_MODEL, "score": case.score_total})
+        for r in results:
+            title  = r.get("title", "")
+            body   = r.get("body", "")
+            url    = r.get("href", "")
+            date   = r.get("published", "")
+            snippet = (title + ". " + body[:200]).strip()
 
-        case_obj = db.query(CaseORM).filter(CaseORM.id == case_id).first()
-        if case_obj:
-            case_obj.status = "review"
-            case_obj.step_reached = 4
-            db.commit()
+            sentiment_score = 0.0
+            sentiment_label = "neutral"
+            try:
+                if snippet:
+                    out    = finbert(snippet[:512])
+                    scores = out[0] if isinstance(out[0], list) else out
+                    best   = max(scores, key=lambda x: x["score"])
+                    lbl    = best["label"].lower()
+                    s      = best["score"]
+                    sentiment_score = round(s if lbl == "positive" else (-s if lbl == "negative" else 0.0), 3)
+                    sentiment_label = lbl
+            except Exception as e:
+                log.warning("FinBERT error: %s", e)
 
-        log.info(f"CAM generation done for {case_id}")
+            findings.append({
+                "query":           query,
+                "title":           title,
+                "body":            body[:400],
+                "url":             url,
+                "date":            date,
+                "sentiment_label": sentiment_label,
+                "sentiment_score": sentiment_score,
+                "weight": (
+                    "Critical" if sentiment_score < -0.6 else
+                    "High"     if sentiment_score < -0.4 else
+                    "Positive" if sentiment_score > 0.4  else "Neutral"
+                ),
+            })
+
+    case["research_findings"] = findings
+    case["updated_at"]        = datetime.utcnow().isoformat()
+
+    avg = round(sum(f["sentiment_score"] for f in findings) / len(findings), 3) if findings else 0.0
+    audit(case_id, "Research Complete", USERS[sid]["name"],
+          f"{len(findings)} articles · avg sentiment {avg}")
+
+    return _research_summary(findings)
+
+@app.get("/api/cases/{case_id}/research", tags=["Research"])
+async def get_research(case_id: str, session_id: Optional[str] = Cookie(None)):
+    sid  = resolve_session(session_id)
+    case = CASES.get(case_id)
+    if not case or case["session_id"] != sid:
+        raise HTTPException(404, "Case not found")
+    return _research_summary(case.get("research_findings", []))
+
+def _research_summary(findings: list[dict]) -> dict:
+    avg = round(sum(f["sentiment_score"] for f in findings) / len(findings), 3) if findings else 0.0
+    return {
+        "findings":             findings,
+        "aggregate_sentiment":  avg,
+        "negative_count":       sum(1 for f in findings if f["sentiment_label"] == "negative"),
+        "positive_count":       sum(1 for f in findings if f["sentiment_label"] == "positive"),
+        "neutral_count":        sum(1 for f in findings if f["sentiment_label"] == "neutral"),
+    }
+
+@app.post("/api/sentiment", tags=["Research"])
+async def sentiment_only(payload: dict):
+    """Quick sentiment check on a list of texts (no case needed)."""
+    texts   = payload.get("texts", [])[:20]
+    finbert = get_finbert()
+    results = []
+    for text in texts:
+        try:
+            out    = finbert(text[:512])
+            scores = out[0] if isinstance(out[0], list) else out
+            best   = max(scores, key=lambda x: x["score"])
+            lbl    = best["label"].lower()
+            score  = round(best["score"] if lbl == "positive" else (-best["score"] if lbl == "negative" else 0.0), 3)
+            results.append({"text": text[:80], "label": lbl, "score": score})
+        except Exception as e:
+            results.append({"text": text[:80], "label": "neutral", "score": 0.0, "error": str(e)})
+    return {"results": results}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ══ 5. LLM — OLLAMA ═══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+
+class OllamaRequest(BaseModel):
+    case_id:         str
+    prompt:          str
+    model:           str = "qwen2.5:72b"
+    ollama_base_url: str = "http://localhost:11434"
+    system_prompt:   str = (
+        "You are a senior Indian credit analyst at a commercial bank. "
+        "Provide concise, factual analysis grounded in RBI norms. "
+        "Flag risks clearly. Use Indian currency and banking terminology."
+    )
+
+@app.post("/api/llm/ollama", tags=["LLM"])
+async def ollama_chat(payload: OllamaRequest, session_id: Optional[str] = Cookie(None)):
+    sid  = resolve_session(session_id)
+    case = CASES.get(payload.case_id)
+    if not case or case["session_id"] != sid:
+        raise HTTPException(404, "Case not found")
+
+    url  = f"{payload.ollama_base_url.rstrip('/')}/api/chat"
+    body = {
+        "model":   payload.model,
+        "stream":  False,
+        "messages":[
+            {"role": "system", "content": payload.system_prompt},
+            {"role": "user",   "content": payload.prompt},
+        ],
+        "options": {"temperature": 0.1, "num_ctx": 8192},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(url, json=body)
+            r.raise_for_status()
+        content = r.json().get("message", {}).get("content", "")
+        audit(payload.case_id, "LLM Inference (Ollama)", USERS[sid]["name"],
+              f"{payload.model} · {len(content)} chars")
+        return {"model": payload.model, "provider": "ollama", "content": content}
+    except httpx.ConnectError:
+        raise HTTPException(503, f"Cannot reach Ollama at {payload.ollama_base_url}")
     except Exception as e:
-        log.error(f"CAM generation failed for {case_id}: {e}")
-        _audit(db, case_id, "system", "llm_error", f"CAM generation failed: {str(e)[:300]}")
-    finally:
-        db.close()
+        raise HTTPException(500, str(e))
 
+@app.get("/api/ollama/models", tags=["LLM"])
+async def list_ollama_models(base_url: str = "http://localhost:11434"):
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{base_url.rstrip('/')}/api/tags")
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        return {"error": str(e), "models": []}
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  DEV ENTRYPOINT
-# ─────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# ══ 6. LLM — OPENAI COMPATIBLE ════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
 
+class OpenAIRequest(BaseModel):
+    case_id:       str
+    prompt:        str
+    api_key:       str
+    model:         str = "gpt-4o"
+    base_url:      str = "https://api.openai.com/v1"
+    system_prompt: str = (
+        "You are a senior Indian credit analyst at a commercial bank. "
+        "Provide concise, factual analysis grounded in RBI norms. "
+        "Flag risks clearly. Use Indian currency and banking terminology."
+    )
+
+@app.post("/api/llm/openai", tags=["LLM"])
+async def openai_chat(payload: OpenAIRequest, session_id: Optional[str] = Cookie(None)):
+    sid  = resolve_session(session_id)
+    case = CASES.get(payload.case_id)
+    if not case or case["session_id"] != sid:
+        raise HTTPException(404, "Case not found")
+    try:
+        client = openai.AsyncOpenAI(api_key=payload.api_key, base_url=payload.base_url)
+        resp   = await client.chat.completions.create(
+            model=payload.model,
+            messages=[
+                {"role": "system", "content": payload.system_prompt},
+                {"role": "user",   "content": payload.prompt},
+            ],
+            temperature=0.1,
+            max_tokens=2048,
+        )
+        content = resp.choices[0].message.content or ""
+        audit(payload.case_id, "LLM Inference (OpenAI)", USERS[sid]["name"],
+              f"{payload.model} · {len(content)} chars")
+        return {"model": payload.model, "provider": "openai_compatible", "content": content}
+    except openai.AuthenticationError:
+        raise HTTPException(401, "Invalid API key")
+    except openai.APIConnectionError:
+        raise HTTPException(503, f"Cannot connect to {payload.base_url}")
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ══ 7. CAM GENERATION ══════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+
+class CAMRequest(BaseModel):
+    provider:         str = "ollama"                      # "ollama" | "openai"
+    api_key:          str = ""                             # required for openai
+    model:            str = "qwen2.5:72b"
+    ollama_base_url:  str = "http://localhost:11434"
+    openai_base_url:  str = "https://api.openai.com/v1"
+
+def _build_cam_prompt(case: dict) -> str:
+    docs   = case_docs(case["case_id"])
+    merged: dict[str, str] = {}
+    for d in docs:
+        merged.update(d.get("parsed_fields", {}))
+
+    research = case.get("research_findings", [])
+    avg_sent = round(sum(r["sentiment_score"] for r in research) / len(research), 3) if research else 0.0
+    neg      = sum(1 for r in research if r["sentiment_label"] == "negative")
+    pos      = sum(1 for r in research if r["sentiment_label"] == "positive")
+    headlines = "\n".join(
+        f"  [{r['sentiment_score']:+.2f}] {r['title']}" for r in research[:8]
+    )
+
+    return f"""You are generating a Credit Appraisal Memo (CAM) for an Indian commercial bank.
+
+CASE:
+  Company      : {case['company_name']}
+  GSTIN        : {case['gstin']}
+  CIN          : {case['cin']}
+  Sector       : {case['sector']}
+  Loan Requested: ₹{case['loan_amount']} Cr
+  Purpose      : {case['purpose']}
+  CAM Ref      : {case['cam_ref']}
+
+EXTRACTED FINANCIAL DATA:
+{json.dumps(merged, indent=2)}
+
+NEWS & RESEARCH ({len(research)} articles · avg sentiment {avg_sent}):
+  Negative: {neg}  Positive: {pos}
+{headlines}
+
+INSTRUCTIONS:
+Generate a structured CAM. Scores are 0–100.
+Respond ONLY with valid JSON (no markdown fences, no preamble).
+
+{{
+  "five_cs": {{
+    "character":  {{"score": <int>, "summary": "<2-3 sentences>"}},
+    "capacity":   {{"score": <int>, "summary": "<2-3 sentences>"}},
+    "capital":    {{"score": <int>, "summary": "<2-3 sentences>"}},
+    "collateral": {{"score": <int>, "summary": "<2-3 sentences>"}},
+    "conditions": {{"score": <int>, "summary": "<2-3 sentences>"}}
+  }},
+  "verdict": "APPROVE" | "CONDITIONAL APPROVE" | "REJECT",
+  "recommended_rate": "<string>",
+  "recommended_tenure": "<string>",
+  "conditions_of_sanction": ["<str>", ...],
+  "key_risks": ["<str>", ...],
+  "executive_summary": "<3-4 sentences for the credit committee>"
+}}""".strip()
+
+def _weighted_score(five_cs: dict) -> float:
+    weights = {"character": 0.20, "capacity": 0.30, "capital": 0.20,
+               "collateral": 0.15, "conditions": 0.15}
+    return round(sum(five_cs.get(k, {}).get("score", 50) * w for k, w in weights.items()), 2)
+
+DEFAULT_FIVE_CS = {
+    k: {"score": 60, "summary": "Insufficient data for automated assessment."}
+    for k in ("character", "capacity", "capital", "collateral", "conditions")
+}
+
+@app.post("/api/cases/{case_id}/generate-cam", tags=["CAM"])
+async def generate_cam(
+    case_id:    str,
+    payload:    CAMRequest,
+    session_id: Optional[str] = Cookie(None),
+):
+    sid  = resolve_session(session_id)
+    case = CASES.get(case_id)
+    if not case or case["session_id"] != sid:
+        raise HTTPException(404, "Case not found")
+
+    prompt = _build_cam_prompt(case)
+
+    # ── Call selected provider ──────────────────────────────
+    if payload.provider == "openai":
+        try:
+            client = openai.AsyncOpenAI(api_key=payload.api_key, base_url=payload.openai_base_url)
+            resp   = await client.chat.completions.create(
+                model=payload.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.05,
+                max_tokens=2048,
+                response_format={"type": "json_object"},
+            )
+            raw = resp.choices[0].message.content or "{}"
+        except openai.AuthenticationError:
+            raise HTTPException(401, "Invalid OpenAI API key")
+        except Exception as e:
+            raise HTTPException(500, f"OpenAI error: {e}")
+    else:
+        url  = f"{payload.ollama_base_url.rstrip('/')}/api/chat"
+        body = {
+            "model":   payload.model,
+            "stream":  False,
+            "messages":[{"role": "user", "content": prompt}],
+            "options": {"temperature": 0.05, "num_ctx": 8192},
+            "format":  "json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                r = await client.post(url, json=body)
+                r.raise_for_status()
+            raw = r.json().get("message", {}).get("content", "{}")
+        except httpx.ConnectError:
+            raise HTTPException(503, "Cannot reach Ollama. Is it running?")
+        except Exception as e:
+            raise HTTPException(500, str(e))
+
+    # ── Parse JSON from LLM ─────────────────────────────────
+    cam_data: dict = {}
+    try:
+        cam_data = json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            try:
+                cam_data = json.loads(m.group(0))
+            except Exception:
+                pass
+
+    five_cs = cam_data.get("five_cs") or DEFAULT_FIVE_CS
+    score   = _weighted_score(five_cs)
+
+    # ── Persist ─────────────────────────────────────────────
+    case["five_cs"]                = five_cs
+    case["score"]                  = score
+    case["verdict"]                = cam_data.get("verdict", "CONDITIONAL APPROVE")
+    case["conditions_of_sanction"] = cam_data.get("conditions_of_sanction", [])
+    case["cam_sections"]           = {
+        "executive_summary":  cam_data.get("executive_summary", ""),
+        "key_risks":          cam_data.get("key_risks", []),
+        "recommended_rate":   cam_data.get("recommended_rate", ""),
+        "recommended_tenure": cam_data.get("recommended_tenure", ""),
+    }
+    case["status"]     = "cam_generated"
+    case["updated_at"] = datetime.utcnow().isoformat()
+
+    audit(case_id, "CAM Generated", USERS[sid]["name"],
+          f"Score: {score} · Verdict: {case['verdict']}")
+
+    return {**cam_data, "weighted_score": score}
+
+@app.get("/api/cases/{case_id}/cam", tags=["CAM"])
+async def get_cam(case_id: str, session_id: Optional[str] = Cookie(None)):
+    sid  = resolve_session(session_id)
+    case = CASES.get(case_id)
+    if not case or case["session_id"] != sid:
+        raise HTTPException(404, "Case not found")
+    return {
+        "case_id":               case_id,
+        "cam_ref":               case.get("cam_ref"),
+        "company_name":          case.get("company_name"),
+        "loan_amount":           case.get("loan_amount"),
+        "score":                 case.get("score"),
+        "verdict":               case.get("verdict"),
+        "five_cs":               case.get("five_cs", {}),
+        "conditions_of_sanction":case.get("conditions_of_sanction", []),
+        "cam_sections":          case.get("cam_sections", {}),
+        "officer_notes":         case.get("officer_notes", ""),
+    }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ══ 8. AUDIT TRAIL ═════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/audit", tags=["Audit"])
+async def get_audit(
+    case_id:    Optional[str] = None,
+    session_id: Optional[str] = Cookie(None),
+):
+    sid      = resolve_session(session_id)
+    my_cases = {c["case_id"] for c in session_cases(sid)}
+    entries  = [e for e in AUDIT_LOG if e["case_id"] in my_cases]
+    if case_id:
+        entries = [e for e in entries if e["case_id"] == case_id]
+    return sorted(entries, key=lambda x: x["ts"], reverse=True)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ══ 9. HEALTH ══════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/health", tags=["Health"])
+async def health():
+    return {
+        "status":        "ok",
+        "cases":         len(CASES),
+        "documents":     len(DOCUMENTS),
+        "audit_entries": len(AUDIT_LOG),
+        "ts":            datetime.utcnow().isoformat(),
+    }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
